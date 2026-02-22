@@ -245,3 +245,12 @@ public class GoodStoreApp {
         }
     }
 }
+//# 1. Переходимо в папку, де знаходиться скомпільований код програми
+//cd "/Users/dimagordeev/Солнышко/untitled6/out/production/untitled6"
+//
+//        # 2. Передаємо терміналу секретні дані (експортуємо змінні середовища для БД)
+//export DB_USER="postgres"
+//export DB_PASS="12345"
+//
+//# 3. Запускаємо програму
+//java GoodStoreApp
