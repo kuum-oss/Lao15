@@ -1,29 +1,40 @@
+import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.*;
+import java.security.MessageDigest;
+import java.nio.charset.StandardCharsets;
 
 public class GoodStoreApp {
 
+    // Кэш тепер прив'язує дані до конкретного email, щоб уникнути конфліктів
     static Map<String, String> cache = new HashMap<>();
     static String lastUserEmail = null;
 
     static final String DB_URL = "jdbc:postgresql://localhost:5432/app";
 
-    // ВИПРАВЛЕНО [Security]: Використовуємо змінні оточення замість хардкоду
-    // Якщо змінні не задані, використовуємо значення за замовчуванням (тільки для розробки)
-    static final String DB_USER = System.getenv("DB_USER") != null ? System.getenv("DB_USER") : "app_user";
-    static final String DB_PASS = System.getenv("DB_PASS") != null ? System.getenv("DB_PASS") : "app_pass";
+    // Строгі змінні оточення без небезпечних хардкодів для продакшену
+    static final String DB_USER = System.getenv("DB_USER");
+    static final String DB_PASS = System.getenv("DB_PASS");
+
+    // "Сіль" для хешування (в ідеалі має генеруватися випадково для кожного користувача і зберігатися в БД)
+    static final String STATIC_SALT = "S0m3R@nd0mS@lt!";
 
     public static void main(String[] args) {
-        // Використовуємо try-with-resources для Scanner
+        if (DB_USER == null || DB_PASS == null) {
+            System.err.println("CRITICAL: DB_USER or DB_PASS environment variables are not set.");
+            System.exit(1);
+        }
+
         try (Scanner sc = new Scanner(System.in)) {
             System.out.println("Welcome!");
 
             while (true) {
-                System.out.println("1 - login, 2 - buy, 3 - report, 0 - exit");
+                System.out.println("\n1 - login, 2 - buy, 3 - report, 4 - logout, 0 - exit");
+                System.out.print("Command: ");
                 String cmd = sc.nextLine();
 
                 if (cmd.equals("0")) break;
@@ -35,27 +46,19 @@ public class GoodStoreApp {
                     System.out.print("password: ");
                     String password = sc.nextLine();
 
-                    // ВИПРАВЛЕНО [Security]: Маскування пароля в логах
-                    System.out.println("[DEBUG] login email=" + email + " pass=***");
+                    System.out.println("[DEBUG] login attempt for email=" + email);
 
-                    // ВИПРАВЛЕНО [Correctness]: Порівняння рядків через .equals()
-                    if ("admin@local".equals(email)) {
-                        System.out.println("admin mode!");
-                    }
-
-                    // ВИПРАВЛЕНО [Security]: Хешування пароля перед кешуванням
-                    // Примітка: для реального проєкту додаем бібліотеку jBCrypt
-                    // String hash = BCrypt.hashpw(password, BCrypt.gensalt());
+                    // Звіряємо хеші, а не паролі в чистому вигляді
                     String hash = hashPasswordSafely(password);
-                    cache.put("pw:" + email, hash);
+                    boolean ok = login(email, hash);
 
-                    boolean ok = login(email, password);
                     if (ok) {
-                        lastUserEmail = email;
-                        System.out.println("OK");
+                        lastUserEmail = email; // Змінюємо користувача тільки при успішному вході
+                        System.out.println("Login successful!");
                     } else {
-                        System.out.println("NO");
+                        System.out.println("Invalid email or password.");
                     }
+
                 } else if (cmd.equals("2")) {
                     if (lastUserEmail == null) {
                         System.out.println("Please login first!");
@@ -68,11 +71,16 @@ public class GoodStoreApp {
                     System.out.print("qty: ");
                     try {
                         int qty = Integer.parseInt(sc.nextLine());
+                        // ВИПРАВЛЕНО: Блокуємо від'ємну і нульову кількість
+                        if (qty <= 0) {
+                            System.out.println("Quantity must be greater than zero.");
+                            continue;
+                        }
                         buy(productId, qty);
-                        System.out.println("Bought!");
                     } catch (NumberFormatException e) {
-                        System.out.println("Invalid quantity format.");
+                        System.out.println("Invalid quantity format. Please enter a number.");
                     }
+
                 } else if (cmd.equals("3")) {
                     if (lastUserEmail == null) {
                         System.out.println("Please login first!");
@@ -80,89 +88,99 @@ public class GoodStoreApp {
                     }
                     String rep = buildReport(lastUserEmail);
                     System.out.println(rep);
+
+                } else if (cmd.equals("4")) {
+                    lastUserEmail = null;
+                    System.out.println("Logged out successfully.");
                 } else {
-                    System.out.println("unknown");
+                    System.out.println("Unknown command");
                 }
             }
         }
     }
 
-    static boolean login(String email, String password) {
-        // ВИПРАВЛЕНО [Security]: Використання PreparedStatement для захисту від SQL Ін'єкцій
-        String sql = "SELECT email, role FROM users WHERE email = ? AND password = ?";
+    // Централізоване отримання з'єднання (в ідеалі тут має бути Connection Pool, напр. HikariCP)
+    static Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+    }
 
-        // ВИПРАВЛЕНО [Architecture]: try-with-resources для автоматичного закриття Connection, PreparedStatement та ResultSet
-        try (Connection c = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+    static boolean login(String email, String passwordHash) {
+        String sql = "SELECT role FROM users WHERE email = ? AND password_hash = ?";
+
+        try (Connection c = getConnection();
              PreparedStatement pst = c.prepareStatement(sql)) {
 
             pst.setString(1, email);
-            pst.setString(2, password); // В ідеалі в БД має бути хеш, і тут ми маємо порівнювати хеші
+            pst.setString(2, passwordHash);
 
             try (ResultSet rs = pst.executeQuery()) {
                 if (rs.next()) {
-                    cache.put("role", rs.getString("role"));
-                    cache.put("loggedIn", "true");
+                    // ВИПРАВЛЕНО: Зберігаємо роль ізольовано для кожного email
+                    cache.put(email + ":role", rs.getString("role"));
                     return true;
                 }
             }
         } catch (SQLException e) {
-            // ВИПРАВЛЕНО: Не залишаємо порожній catch блок
             System.err.println("Database error during login: " + e.getMessage());
         }
-
         return false;
     }
 
     static void buy(String productId, int qty) {
-        int p = getPrice(productId);
-        if (p < 0) {
-            System.out.println("Product not found or invalid price.");
+        BigDecimal price = getPrice(productId);
+        if (price == null) {
+            System.out.println("Product not found.");
             return;
         }
 
-        int total = p * qty;
-        if (total > 1000) {
-            total = total - 7;
+        // ВИПРАВЛЕНО: Використання BigDecimal для точного розрахунку грошей
+        BigDecimal total = price.multiply(BigDecimal.valueOf(qty));
+        BigDecimal discountThreshold = new BigDecimal("1000.00");
+
+        if (total.compareTo(discountThreshold) > 0) {
+            BigDecimal discount = new BigDecimal("7.00");
+            total = total.subtract(discount);
+            System.out.println("Discount applied!");
         }
 
-        // ВИПРАВЛЕНО [Security]: Використання PreparedStatement
         String sql = "INSERT INTO orders(email, product_id, qty, total) VALUES (?, ?, ?, ?)";
 
-        try (Connection c = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+        try (Connection c = getConnection();
              PreparedStatement pst = c.prepareStatement(sql)) {
 
             pst.setString(1, lastUserEmail);
             pst.setString(2, productId);
             pst.setInt(3, qty);
-            pst.setInt(4, total);
+            pst.setBigDecimal(4, total);
 
-            pst.executeUpdate();
+            int rows = pst.executeUpdate();
+            if (rows > 0) {
+                System.out.println("Bought successfully! Total: " + total);
+            }
 
         } catch (SQLException e) {
             System.err.println("Database error during purchase: " + e.getMessage());
         }
     }
 
-    static int getPrice(String productId) {
-        // ВИПРАВЛЕНО [Security]: Використання PreparedStatement
+    static BigDecimal getPrice(String productId) {
         String sql = "SELECT price FROM products WHERE id = ?";
 
-        try (Connection c = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+        try (Connection c = getConnection();
              PreparedStatement pst = c.prepareStatement(sql)) {
 
-            // Якщо id в базі це число, краще змінити на pst.setInt()
             pst.setString(1, productId);
 
             try (ResultSet rs = pst.executeQuery()) {
                 if (rs.next()) {
-                    return rs.getInt("price");
+                    return rs.getBigDecimal("price");
                 }
             }
         } catch (SQLException e) {
             System.err.println("Database error while fetching price: " + e.getMessage());
         }
-
-        return -1;
+        // Замість магічного числа -1 повертаємо null, якщо товару немає
+        return null;
     }
 
     static String buildReport(String email) {
@@ -170,20 +188,40 @@ public class GoodStoreApp {
             return "empty";
         }
 
-        String role = cache.getOrDefault("role", "guest");
-        List<String> lines = new ArrayList<>();
+        // Отримуємо роль конкретного користувача
+        String role = cache.getOrDefault(email + ":role", "guest");
+        int limit = role.equals("admin") ? 50 : 10;
 
-        // ВИПРАВЛЕНО [Security]: Використання PreparedStatement
-        String sql = "SELECT product_id, qty, total FROM orders WHERE email = ? ORDER BY id DESC";
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n--- Report for ").append(email).append(" ---\n");
+        sb.append("Role: ").append(role).append("\n");
 
-        try (Connection c = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+        // ВИПРАВЛЕНО: Обмеження вибірки (LIMIT) на рівні БД, а не в пам'яті
+        // Додано LIMIT + 1, щоб перевірити, чи є ще записи понад ліміт
+        String sql = "SELECT product_id, qty, total FROM orders WHERE email = ? ORDER BY id DESC LIMIT ?";
+
+        try (Connection c = getConnection();
              PreparedStatement pst = c.prepareStatement(sql)) {
 
             pst.setString(1, email);
+            pst.setInt(2, limit + 1);
 
             try (ResultSet rs = pst.executeQuery()) {
+                int count = 1;
                 while (rs.next()) {
-                    lines.add(rs.getString("product_id") + ":" + rs.getInt("qty") + ":" + rs.getInt("total"));
+                    if (count > limit) {
+                        sb.append("...and more\n");
+                        break;
+                    }
+                    sb.append(count).append(") Product: ")
+                            .append(rs.getString("product_id"))
+                            .append(" | Qty: ").append(rs.getInt("qty"))
+                            .append(" | Total: ").append(rs.getBigDecimal("total"))
+                            .append("\n");
+                    count++;
+                }
+                if (count == 1) {
+                    sb.append("No orders found.\n");
                 }
             }
         } catch (SQLException e) {
@@ -191,30 +229,16 @@ public class GoodStoreApp {
             return "Error generating report.";
         }
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("Report for ").append(email).append("\n");
-        sb.append("role=").append(role).append("\n");
-
-        // ВИПРАВЛЕНО [Correctness]: Усунуто помилку "Off-by-one" (i < lines.size())
-        for (int i = 0; i < lines.size(); i++) {
-            sb.append(i + 1).append(") ").append(lines.get(i)).append("\n"); // Зробив нумерацію з 1 для кращої читабельності
-        }
-
-        int limit = role.equals("admin") ? 50 : 10;
-
-        if (lines.size() > limit) {
-            sb.append("...and more\n");
-        }
-
+        sb.append("---------------------------");
         return sb.toString();
     }
 
-    // Заглушка для безпечного хешування.
-    // В реальному проєкті використовуйте BCrypt.hashpw()
     static String hashPasswordSafely(String plainText) {
         try {
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
-            byte[] hash = md.digest(plainText.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            // Додаємо "сіль" для захисту від Rainbow Tables
+            String saltedPassword = plainText + STATIC_SALT;
+            byte[] hash = md.digest(saltedPassword.getBytes(StandardCharsets.UTF_8));
             return Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
             throw new RuntimeException("Failed to hash password", e);
